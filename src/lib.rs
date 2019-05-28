@@ -261,8 +261,8 @@ impl Timer {
             self.timer_heap.remove(heap_slot);
         }
         *slot = Some(self.timer_heap.push(HeapTimer {
-            at: at,
-            gen: gen,
+            at,
+            gen,
             node: node.clone(),
         }));
     }
@@ -281,6 +281,12 @@ impl Timer {
     fn invalidate(&mut self, node: ScheduledTimer) {
         node.state.fetch_or(0b10, SeqCst);
         node.waker.wake();
+    }
+}
+
+impl Default for Timer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

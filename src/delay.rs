@@ -51,7 +51,7 @@ impl Delay {
     pub fn new_handle(at: Instant, handle: TimerHandle) -> Delay {
         let state = ScheduledTimer::at(at, handle);
         if let Some(state) = state {
-            if let Ok(_) = state.push_and_wake() {
+            if state.push_and_wake().is_ok() {
                 return Delay {
                     state: Some(state),
                     when: at,
@@ -162,12 +162,14 @@ impl Future for Delay {
 }
 
 impl Drop for Delay {
+    #[allow(unused_must_use)]
     fn drop(&mut self) {
         let state = match self.state.take() {
             Some(s) => s,
             None => return,
         };
         *state.at.lock().unwrap() = None;
-        drop(state.push_and_wake());
+        // This can error out, but since we're dropping we just ignore it
+        state.push_and_wake();
     }
 }

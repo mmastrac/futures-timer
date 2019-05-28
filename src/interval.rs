@@ -82,13 +82,13 @@ impl Stream for Interval {
 fn duration_to_nanos(dur: Duration) -> Option<u64> {
     dur.as_secs()
         .checked_mul(1_000_000_000)
-        .and_then(|v| v.checked_add(dur.subsec_nanos() as u64))
+        .and_then(|v| v.checked_add(u64::from(dur.subsec_nanos())))
 }
 
 fn next_interval(prev: Instant, now: Instant, interval: Duration) -> Instant {
     let new = prev + interval;
     if new > now {
-        return new;
+        new
     } else {
         let spent_ns =
             duration_to_nanos(now.duration_since(prev)).expect("interval should be expired");
@@ -102,7 +102,7 @@ fn next_interval(prev: Instant, now: Instant, interval: Duration) -> Instant {
             interval,
             mult
         );
-        return prev + interval * (mult as u32);
+        prev + interval * (mult as u32)
     }
 }
 

@@ -2,7 +2,7 @@ use std::future::Future;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::task::Context;
+use std::task::{Context, Poll};
 use std::thread;
 use std::time::Instant;
 
@@ -54,14 +54,14 @@ impl Drop for HelperThread {
 }
 
 fn run(timer: Timer, done: Arc<AtomicBool>) {
-    let mut waker = ArcWake::into_waker(Arc::new(CurrentThreadWaker {
+    let waker = ArcWake::into_waker(Arc::new(CurrentThreadWaker {
         thread: thread::current(),
     }));
-    let mut cx = Context::from_waker(&mut waker);
+    let mut cx = Context::from_waker(&waker);
 
     pin_mut!(timer);
     while !done.load(Ordering::SeqCst) {
-        drop(timer.as_mut().poll(&mut cx));
+        assert_eq!(timer.as_mut().poll(&mut cx), Poll::Pending);
 
         timer.advance();
         match timer.next_event() {
@@ -75,7 +75,7 @@ fn run(timer: Timer, done: Arc<AtomicBool>) {
                 }
             }
 
-            // Just wait for one of our futures to wake up
+            // Just wait for one of our futures to wake us up
             None => thread::park(),
         }
     }
