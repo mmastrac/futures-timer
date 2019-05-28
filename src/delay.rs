@@ -6,15 +6,10 @@
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::SeqCst;
-use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use futures::task::AtomicWaker;
-
-use crate::arc_list::Node;
 use crate::{ScheduledTimer, TimerHandle};
 
 /// A future representing the notification that an elapsed duration has
@@ -26,7 +21,7 @@ use crate::{ScheduledTimer, TimerHandle};
 /// granularity after the exact instant that they're otherwise indicated to
 /// fire at.
 pub struct Delay {
-    state: Option<Arc<Node<ScheduledTimer>>>,
+    state: Option<ScheduledTimer>,
     when: Instant,
 }
 
@@ -54,36 +49,21 @@ impl Delay {
     /// The returned instance of `Delay` will be bound to the timer specified by
     /// the `handle` argument.
     pub fn new_handle(at: Instant, handle: TimerHandle) -> Delay {
-        let inner = match handle.inner.upgrade() {
-            Some(i) => i,
-            None => {
+        let state = ScheduledTimer::at(at, handle);
+        if let Some(state) = state {
+            if let Ok(_) = state.push_and_wake() {
                 return Delay {
-                    state: None,
+                    state: Some(state),
                     when: at,
-                }
+                };
             }
-        };
-        let state = Arc::new(Node::new(ScheduledTimer {
-            at: Mutex::new(Some(at)),
-            state: AtomicUsize::new(0),
-            waker: AtomicWaker::new(),
-            inner: handle.inner,
-            slot: Mutex::new(None),
-        }));
+        }
 
         // If we fail to actually push our node then we've become an inert
         // timer, meaning that we'll want to immediately return an error from
         // `poll`.
-        if inner.list.push(&state).is_err() {
-            return Delay {
-                state: None,
-                when: at,
-            };
-        }
-
-        inner.waker.wake();
         Delay {
-            state: Some(state),
+            state: None,
             when: at,
         }
     }
@@ -113,6 +93,9 @@ impl Delay {
     #[inline]
     pub fn reset_at(&mut self, at: Instant) {
         self.when = at;
+
+        // If we fail to push our node then we've become an inert timer, so
+        // we'll want to clear our `state` field accordingly
         if self._reset(at).is_err() {
             self.state = None
         }
@@ -123,27 +106,21 @@ impl Delay {
             Some(ref state) => state,
             None => return Err(()),
         };
-        if let Some(timeouts) = state.inner.upgrade() {
-            let mut bits = state.state.load(SeqCst);
-            loop {
-                // If we've been invalidated, cancel this reset
-                if bits & 0b10 != 0 {
-                    return Err(());
-                }
-                let new = bits.wrapping_add(0b100) & !0b11;
-                match state.state.compare_exchange(bits, new, SeqCst, SeqCst) {
-                    Ok(_) => break,
-                    Err(s) => bits = s,
-                }
+        let mut bits = state.state.load(SeqCst);
+        loop {
+            // If we've been invalidated, cancel this reset
+            if bits & 0b10 != 0 {
+                return Err(());
             }
-            *state.at.lock().unwrap() = Some(at);
-            // If we fail to push our node then we've become an inert timer, so
-            // we'll want to clear our `state` field accordingly
-            timeouts.list.push(state)?;
-            timeouts.waker.wake();
+            let new = bits.wrapping_add(0b100) & !0b11;
+            match state.state.compare_exchange(bits, new, SeqCst, SeqCst) {
+                Ok(_) => break,
+                Err(s) => bits = s,
+            }
         }
+        *state.at.lock().unwrap() = Some(at);
 
-        Ok(())
+        state.push_and_wake()
     }
 }
 
@@ -186,15 +163,11 @@ impl Future for Delay {
 
 impl Drop for Delay {
     fn drop(&mut self) {
-        let state = match self.state {
-            Some(ref s) => s,
+        let state = match self.state.take() {
+            Some(s) => s,
             None => return,
         };
-        if let Some(timeouts) = state.inner.upgrade() {
-            *state.at.lock().unwrap() = None;
-            if timeouts.list.push(state).is_ok() {
-                timeouts.waker.wake();
-            }
-        }
+        *state.at.lock().unwrap() = None;
+        drop(state.push_and_wake());
     }
 }

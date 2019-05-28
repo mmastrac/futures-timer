@@ -113,7 +113,7 @@ pub struct Timer {
 /// A handle to a `Timer` which is used to create instances of a `Delay`.
 #[derive(Clone)]
 pub struct TimerHandle {
-    inner: Weak<Inner>,
+    inner: Option<Arc<Inner>>,
 }
 
 mod delay;
@@ -123,14 +123,44 @@ pub use self::interval::Interval;
 
 struct Inner {
     /// List of updates the `Timer` needs to process
-    list: ArcList<ScheduledTimer>,
+    list: ArcList<ScheduledTimerInner>,
 
     /// The blocked `Timer` task to receive notifications to the `list` above.
     waker: AtomicWaker,
 }
 
+#[derive(Clone)]
+struct ScheduledTimer(Arc<Node<ScheduledTimerInner>>);
+
+impl ScheduledTimer {
+    fn at(at: Instant, handle: TimerHandle) -> Option<Self> {
+        let inner = handle.inner?;
+        Some(Self(Arc::new(Node::new(ScheduledTimerInner {
+            at: Mutex::new(Some(at)),
+            state: AtomicUsize::new(0),
+            waker: AtomicWaker::new(),
+            inner,
+            slot: Mutex::new(None),
+        }))))
+    }
+
+    fn push_and_wake(&self) -> Result<(), ()> {
+        self.inner.list.push(&self.0)?;
+        self.inner.waker.wake();
+        Ok(())
+    }
+}
+
+impl std::ops::Deref for ScheduledTimer {
+    type Target = ScheduledTimerInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 /// Shared state between the `Timer` and a `Delay`.
-struct ScheduledTimer {
+struct ScheduledTimerInner {
     waker: AtomicWaker,
 
     // The lowest bit here is whether the timer has fired or not, the second
@@ -139,7 +169,7 @@ struct ScheduledTimer {
     // function. Only timers for a matching generation are fired.
     state: AtomicUsize,
 
-    inner: Weak<Inner>,
+    inner: Arc<Inner>,
     at: Mutex<Option<Instant>>,
 
     // TODO: this is only accessed by the timer thread, should have a more
@@ -152,7 +182,7 @@ struct ScheduledTimer {
 struct HeapTimer {
     at: Instant,
     gen: usize,
-    node: Arc<Node<ScheduledTimer>>,
+    node: ScheduledTimer,
 }
 
 impl Timer {
@@ -170,7 +200,7 @@ impl Timer {
     /// Returns a handle to this timer heap, used to create new timeouts.
     pub fn handle(&self) -> TimerHandle {
         TimerHandle {
-            inner: Arc::downgrade(&self.inner),
+            inner: Some(self.inner.clone()),
         }
     }
 
@@ -191,7 +221,7 @@ impl Timer {
         self.advance_to(Instant::now())
     }
 
-    /// Proces any timers which are supposed to fire before `now` specified.
+    /// Process any timers which are supposed to fire before `now` specified.
     ///
     /// This method should be called on `Timer` periodically to advance the
     /// internal state and process any pending timers which need to fire.
@@ -221,7 +251,7 @@ impl Timer {
 
     /// Either updates the timer at slot `idx` to fire at `at`, or adds a new
     /// timer at `idx` and sets it to fire at `at`.
-    fn update_or_add(&mut self, at: Instant, node: Arc<Node<ScheduledTimer>>) {
+    fn update_or_add(&mut self, at: Instant, node: ScheduledTimer) {
         // TODO: avoid remove + push and instead just do one sift of the heap?
         // In theory we could update it in place and then do the percolation
         // as necessary
@@ -237,7 +267,7 @@ impl Timer {
         }));
     }
 
-    fn remove(&mut self, node: Arc<Node<ScheduledTimer>>) {
+    fn remove(&mut self, node: ScheduledTimer) {
         // If this `idx` is still around and it's still got a registered timer,
         // then we jettison it form the timer heap.
         let mut slot = node.slot.lock().unwrap();
@@ -248,7 +278,7 @@ impl Timer {
         self.timer_heap.remove(heap_slot);
     }
 
-    fn invalidate(&mut self, node: Arc<Node<ScheduledTimer>>) {
+    fn invalidate(&mut self, node: ScheduledTimer) {
         node.state.fetch_or(0b10, SeqCst);
         node.waker.wake();
     }
@@ -261,6 +291,7 @@ impl Future for Timer {
         Pin::new(&mut self.inner).waker.register(cx.waker());
         let mut list = self.inner.list.take();
         while let Some(node) = list.pop() {
+            let node = ScheduledTimer(node);
             let at = *node.at.lock().unwrap();
             match at {
                 Some(at) => self.update_or_add(at, node),
@@ -282,6 +313,7 @@ impl Drop for Timer {
         // updates and also drain our heap of all active timers, invalidating
         // everything.
         while let Some(t) = list.pop() {
+            let t = ScheduledTimer(t);
             self.invalidate(t);
         }
         while let Some(t) = self.timer_heap.pop() {
@@ -340,24 +372,30 @@ impl TimerHandle {
     /// returning an error. Once a call to `set_as_global_fallback` is
     /// successful then no future calls may succeed.
     pub fn set_as_global_fallback(self) -> Result<(), SetDefaultError> {
-        unsafe {
-            let val = self.into_usize();
-            match HANDLE_FALLBACK.compare_exchange(0, val, SeqCst, SeqCst) {
-                Ok(_) => Ok(()),
-                Err(_) => {
-                    drop(TimerHandle::from_usize(val));
-                    Err(SetDefaultError(()))
-                }
+        let val = self.into_usize();
+        match HANDLE_FALLBACK.compare_exchange(0, val, SeqCst, SeqCst) {
+            Ok(_) => Ok(()),
+            Err(_) => {
+                Self::drop_weak(val);
+                Err(SetDefaultError(()))
             }
         }
     }
 
     fn into_usize(self) -> usize {
-        unsafe { mem::transmute::<Weak<Inner>, usize>(self.inner) }
+        let weak = Arc::downgrade(&self.inner.unwrap());
+        unsafe { mem::transmute::<Weak<Inner>, usize>(weak) }
+    }
+
+    fn drop_weak(val: usize) {
+        let inner = unsafe { mem::transmute::<usize, Weak<Inner>>(val) };
+        drop(inner);
     }
 
     unsafe fn from_usize(val: usize) -> TimerHandle {
-        let inner = mem::transmute::<usize, Weak<Inner>>(val);;
+        let weak = mem::transmute::<usize, Weak<Inner>>(val);
+        let inner = weak.upgrade();
+        mem::forget(weak);
         TimerHandle { inner }
     }
 }
@@ -374,7 +412,7 @@ impl Default for TimerHandle {
         if fallback == 0 {
             let helper = match global::HelperThread::new() {
                 Ok(helper) => helper,
-                Err(_) => return TimerHandle { inner: Weak::new() },
+                Err(_) => return TimerHandle { inner: None },
             };
 
             // If we successfully set ourselves as the actual fallback then we
@@ -396,11 +434,7 @@ impl Default for TimerHandle {
         // its value to reify a handle, clone it, and then forget our reified
         // handle as we don't actually have an owning reference to it.
         assert!(fallback != 0);
-        unsafe {
-            let handle = TimerHandle::from_usize(fallback);
-            let ret = handle.clone();
-            drop(handle.into_usize());
-            return ret;
-        }
+
+        unsafe { TimerHandle::from_usize(fallback) }
     }
 }
