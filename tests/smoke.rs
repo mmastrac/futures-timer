@@ -9,6 +9,7 @@ use std::pin::Pin;
 use std::task::Poll;
 
 use futures::prelude::*;
+use pin_utils::pin_mut;
 
 fn far_future() -> Instant {
     Instant::now() + Duration::new(5000, 0)
@@ -63,11 +64,11 @@ async fn reset() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
 async fn drop_timer_wakes() {
     let t = Timer::new();
     let handle = t.handle();
-    let mut timeout = Delay::new_handle(far_future(), handle);
     let mut t = Some(t);
+    let timeout = Delay::new_handle(far_future(), handle);
+    pin_mut!(timeout);
     let f = poll_fn(move |cx| {
-        let timeout = unsafe { Pin::new_unchecked(&mut timeout) };
-        match TryFuture::try_poll(timeout, cx) {
+        match timeout.as_mut().try_poll(cx) {
             Poll::Pending => {}
             other => return other,
         }

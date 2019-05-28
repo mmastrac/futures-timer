@@ -1,13 +1,12 @@
 use std::future::Future;
 use std::io;
-use std::mem::{self, ManuallyDrop};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::task::{Context, RawWaker, RawWakerVTable, Waker};
+use std::task::Context;
 use std::thread;
-use std::thread::Thread;
 use std::time::Instant;
 
+use futures::task::ArcWake;
 use pin_utils::pin_mut;
 
 use crate::{Timer, TimerHandle};
@@ -55,7 +54,9 @@ impl Drop for HelperThread {
 }
 
 fn run(timer: Timer, done: Arc<AtomicBool>) {
-    let mut waker = current_thread_waker();
+    let mut waker = ArcWake::into_waker(Arc::new(CurrentThreadWaker {
+        thread: thread::current(),
+    }));
     let mut cx = Context::from_waker(&mut waker);
 
     pin_mut!(timer);
@@ -80,27 +81,12 @@ fn run(timer: Timer, done: Arc<AtomicBool>) {
     }
 }
 
-static VTABLE: RawWakerVTable = RawWakerVTable::new(raw_clone, raw_wake, raw_wake_by_ref, raw_drop);
-
-fn raw_clone(ptr: *const ()) -> RawWaker {
-    let me = ManuallyDrop::new(unsafe { Arc::from_raw(ptr as *const Thread) });
-    mem::forget(me.clone());
-    RawWaker::new(ptr, &VTABLE)
+struct CurrentThreadWaker {
+    thread: thread::Thread,
 }
 
-fn raw_wake(ptr: *const ()) {
-    unsafe { Arc::from_raw(ptr as *const Thread) }.unpark()
-}
-
-fn raw_wake_by_ref(ptr: *const ()) {
-    ManuallyDrop::new(unsafe { Arc::from_raw(ptr as *const Thread) }).unpark()
-}
-
-fn raw_drop(ptr: *const ()) {
-    unsafe { Arc::from_raw(ptr as *const Thread) };
-}
-
-fn current_thread_waker() -> Waker {
-    let thread = Arc::new(thread::current());
-    unsafe { Waker::from_raw(raw_clone(Arc::into_raw(thread) as *const ())) }
+impl ArcWake for CurrentThreadWaker {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        arc_self.thread.unpark()
+    }
 }

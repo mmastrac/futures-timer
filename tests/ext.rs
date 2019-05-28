@@ -2,24 +2,22 @@
 
 use std::error::Error;
 use std::io;
-use std::time::Duration;
 use std::task::Poll;
 use std::thread;
+use std::time::Duration;
 
-use futures::future::poll_fn;
 use futures::channel::mpsc::*;
+use futures::future::poll_fn;
+use futures::TryStreamExt;
 use futures_timer::Delay;
 use futures_timer::{FutureTimerExt, StreamTimerExt};
-use futures::TryStreamExt;
 
 type TestResult = io::Result<()>;
 
 #[runtime::test]
 async fn future_timeout() -> TestResult {
     // Never completes
-    let long_future = poll_fn::<TestResult, _>(|_| {
-        Poll::Pending
-    });
+    let long_future = poll_fn::<TestResult, _>(|_| Poll::Pending);
 
     let res = long_future.timeout(Duration::from_millis(100)).await;
     assert_eq!("future timed out", res.unwrap_err().description());
@@ -36,7 +34,6 @@ async fn future_doesnt_timeout() -> TestResult {
 
 #[runtime::test]
 async fn stream() -> TestResult {
-
     let dur = Duration::from_millis(10);
     Delay::new(dur).await?;
     Delay::new(dur).await?;
@@ -62,9 +59,15 @@ async fn stream_timeout() -> TestResult {
     loop {
         let next = f.try_next().await;
         match next {
-            Ok(None) => { break; }
-            Ok(_) => { ok += 1; }
-            Err(_) => { err += 1; }
+            Ok(None) => {
+                break;
+            }
+            Ok(_) => {
+                ok += 1;
+            }
+            Err(_) => {
+                err += 1;
+            }
         }
     }
 
